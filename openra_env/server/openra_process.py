@@ -13,11 +13,13 @@ import logging
 import os
 import signal
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+_MAX_LOG_CHARS = 200_000
 
 # Global registry for atexit/signal cleanup
 _active_managers: list["OpenRAProcessManager"] = []
@@ -71,8 +73,10 @@ class OpenRAProcessManager:
     def __init__(self, config: Optional[OpenRAConfig] = None):
         self.config = config or OpenRAConfig()
         self._process: Optional[subprocess.Popen] = None
-        self._stdout_log: list[str] = []
-        self._stderr_log: list[str] = []
+        self._stdout_log = ""
+        self._stderr_log = ""
+        self._stdout_lock = threading.Lock()
+        self._stderr_lock = threading.Lock()
 
     def launch(self) -> int:
         """Launch a new OpenRA game instance.
@@ -99,6 +103,9 @@ class OpenRAProcessManager:
             cwd=self.config.openra_path,
             env=env,
         )
+        self._stdout_log = ""
+        self._stderr_log = ""
+        self._start_log_drainers()
         logger.info(f"OpenRA launched with PID {self._process.pid}")
 
         # Register for global cleanup
@@ -106,6 +113,42 @@ class OpenRAProcessManager:
             _active_managers.append(self)
 
         return self._process.pid
+
+    def _append_log(self, stream_name: str, text: str) -> None:
+        lock = self._stdout_lock if stream_name == "stdout" else self._stderr_lock
+        attr = "_stdout_log" if stream_name == "stdout" else "_stderr_log"
+        with lock:
+            combined = getattr(self, attr) + text
+            if len(combined) > _MAX_LOG_CHARS:
+                combined = combined[-_MAX_LOG_CHARS:]
+            setattr(self, attr, combined)
+
+    def _drain_stream(self, stream, stream_name: str) -> None:
+        try:
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                self._append_log(stream_name, chunk.decode("utf-8", errors="replace"))
+        except Exception as exc:
+            logger.debug(f"Failed draining OpenRA {stream_name}: {exc}")
+
+    def _start_log_drainers(self) -> None:
+        if self._process is None:
+            return
+
+        if self._process.stdout is not None:
+            threading.Thread(
+                target=self._drain_stream,
+                args=(self._process.stdout, "stdout"),
+                daemon=True,
+            ).start()
+        if self._process.stderr is not None:
+            threading.Thread(
+                target=self._drain_stream,
+                args=(self._process.stderr, "stderr"),
+                daemon=True,
+            ).start()
 
     def _build_command(self) -> list[str]:
         """Build the command line for launching OpenRA.
@@ -226,39 +269,14 @@ class OpenRAProcessManager:
         return rc
 
     def get_stdout(self) -> str:
-        """Read available stdout from the process."""
-        if self._process is None or self._process.stdout is None:
-            return ""
-        try:
-            # Non-blocking read
-            import select
-
-            if select.select([self._process.stdout], [], [], 0.0)[0]:
-                data = self._process.stdout.read(4096)
-                if data:
-                    text = data.decode("utf-8", errors="replace")
-                    self._stdout_log.append(text)
-                    return text
-        except Exception:
-            pass
-        return ""
+        """Return the buffered stdout tail for the process."""
+        with self._stdout_lock:
+            return self._stdout_log
 
     def get_stderr(self) -> str:
-        """Read available stderr from the process."""
-        if self._process is None or self._process.stderr is None:
-            return ""
-        try:
-            import select
-
-            if select.select([self._process.stderr], [], [], 0.0)[0]:
-                data = self._process.stderr.read(4096)
-                if data:
-                    text = data.decode("utf-8", errors="replace")
-                    self._stderr_log.append(text)
-                    return text
-        except Exception:
-            pass
-        return ""
+        """Return the buffered stderr tail for the process."""
+        with self._stderr_lock:
+            return self._stderr_log
 
     @property
     def pid(self) -> Optional[int]:
