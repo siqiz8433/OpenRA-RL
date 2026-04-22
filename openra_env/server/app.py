@@ -98,57 +98,64 @@ def _env_factory():
     )
 
 
-app = create_app(
-    _env_factory,
-    OpenRAAction,
-    OpenRAObservation,
-    env_name="openra_env",
-    max_concurrent_envs=_max_concurrent,
-)
+_app = None
 
 
-@app.on_event("startup")
-def _on_startup():
-    """Startup hook for web app only. Daemon starts lazily on demand."""
-    pass
+def get_app():
+    global _app
+    if _app is not None:
+        return _app
 
+    app = create_app(
+        _env_factory,
+        OpenRAAction,
+        OpenRAObservation,
+        env_name="openra_env",
+        max_concurrent_envs=_max_concurrent,
+    )
 
-@app.on_event("shutdown")
-def _on_shutdown():
-    """Kill the game daemon when uvicorn shuts down."""
-    if _daemon.is_alive():
-        print(f"Shutting down game daemon (PID {_daemon.pid})...")
-        _daemon.kill(timeout=10.0)
-    else:
-        _daemon.reap()
+    @app.on_event("startup")
+    def _on_startup():
+        """Startup hook for web app only. Daemon starts lazily on demand."""
+        pass
 
+    @app.on_event("shutdown")
+    def _on_shutdown():
+        """Kill the game daemon when uvicorn shuts down."""
+        if _daemon.is_alive():
+            print(f"Shutting down game daemon (PID {_daemon.pid})...")
+            _daemon.kill(timeout=10.0)
+        else:
+            _daemon.reap()
 
-@app.get("/health")
-def health_check():
-    """Lightweight health check for web/container probes."""
-    return {"status": "healthy"}
+    @get_app().get("/health")
+    def health_check():
+        """Lightweight health check for web/container probes."""
+        return {"status": "healthy"}
 
+    @get_app().get("/daemon-health")
+    def daemon_health():
+        """Detailed daemon/gRPC health for debugging."""
+        alive = _daemon.is_alive()
+        grpc_ok = False
+        if alive:
+            try:
+                _ch = grpc.insecure_channel(f"localhost:{_base_grpc_port}")
+                grpc.channel_ready_future(_ch).result(timeout=2.0)
+                grpc_ok = True
+                _ch.close()
+            except Exception:
+                pass
+        return {
+            "status": "healthy" if (alive and grpc_ok) else "degraded",
+            "daemon_pid": _daemon.pid,
+            "daemon_alive": alive,
+            "grpc_ok": grpc_ok,
+            "grpc_port": _base_grpc_port,
+        }
 
-@app.get("/daemon-health")
-def daemon_health():
-    """Detailed daemon/gRPC health for debugging."""
-    alive = _daemon.is_alive()
-    grpc_ok = False
-    if alive:
-        try:
-            _ch = grpc.insecure_channel(f"localhost:{_base_grpc_port}")
-            grpc.channel_ready_future(_ch).result(timeout=2.0)
-            grpc_ok = True
-            _ch.close()
-        except Exception:
-            pass
-    return {
-        "status": "healthy" if (alive and grpc_ok) else "degraded",
-        "daemon_pid": _daemon.pid,
-        "daemon_alive": alive,
-        "grpc_ok": grpc_ok,
-        "grpc_port": _base_grpc_port,
-    }
+    _app = app
+    return _app
 
 
 def _latest_replay_file() -> Path | None:
@@ -169,7 +176,7 @@ def _latest_replay_file() -> Path | None:
     return max(replays, key=lambda p: p.stat().st_mtime)
 
 
-@app.get("/replays/latest")
+@get_app().get("/replays/latest")
 def latest_replay(download: bool = Query(True, description="Return the latest replay file when true, otherwise return metadata only.")):
     replay = _latest_replay_file()
     if replay is None:
@@ -191,7 +198,7 @@ def latest_replay(download: bool = Query(True, description="Return the latest re
     )
 
 
-@app.post("/shutdown")
+@get_app().post("/shutdown")
 def shutdown_server():
     """Gracefully shut down the game daemon and exit."""
     import threading
@@ -227,7 +234,7 @@ def _cleanup_scenario_maps():
     if n_removed > 0:
         print(f"Cleaned up {n_removed} old scenario maps from {maps_dir}")
 
-@app.post("/restart-daemon")
+@get_app().post("/restart-daemon")
 def restart_daemon():
     """Kill and restart the .NET daemon on a NEW gRPC port for truly clean state."""
     global _base_grpc_port
@@ -659,7 +666,7 @@ async def _run_try_agent(opponent: str):
         yield _sse("error_event", {"message": str(e)})
 
 
-@app.get("/try-agent")
+@get_app().get("/try-agent")
 async def try_agent(
     opponent: str = Query("Normal", pattern="^(Easy|Normal|Hard)$"),
 ):
@@ -1046,7 +1053,7 @@ footer {
 </html>"""
 
 
-@app.get("/", response_class=HTMLResponse)
+@get_app().get("/", response_class=HTMLResponse)
 async def root():
     """Landing page for the HuggingFace Space."""
     return LANDING_PAGE
@@ -1377,7 +1384,7 @@ fetch('/try-status')
 </html>"""
 
 
-@app.get("/try-status")
+@get_app().get("/try-status")
 async def try_status():
     """Check if a game is currently running."""
     return {
@@ -1386,7 +1393,7 @@ async def try_status():
     }
 
 
-@app.get("/try", response_class=HTMLResponse)
+@get_app().get("/try", response_class=HTMLResponse)
 async def try_page():
     """Interactive page to watch an LLM agent play Red Alert."""
     return TRY_PAGE
@@ -1403,7 +1410,7 @@ def main():
     args = parser.parse_args()
 
     uvicorn.run(
-        app,
+        get_app(),
         host=args.host,
         port=args.port,
         ws_ping_interval=None,
