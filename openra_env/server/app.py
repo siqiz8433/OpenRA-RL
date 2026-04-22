@@ -62,6 +62,15 @@ _daemon = OpenRAProcessManager(OpenRAConfig(
 # No shared channel needed — eliminates HTTP/2 contention and grpc_worker bottleneck.
 
 
+def _env_factory():
+    return OpenRAEnvironment(
+        grpc_port=_base_grpc_port,
+        multi_session=True,
+    )
+
+
+# Launch daemon on first import (idempotent — checks if already running)
+# Fail fast if port is already in use (stale daemon from crashed process)
 def _check_port_free(port: int) -> None:
     with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
         s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
@@ -78,23 +87,11 @@ def _check_port_free(port: int) -> None:
             # TIME_WAIT only — safe to proceed
             print(f"Port {port} in TIME_WAIT, proceeding with SO_REUSEADDR")
 
-
-def _ensure_daemon_started() -> None:
-    if _daemon.is_alive():
-        return
-
-    _daemon.reap()
+if not _daemon.is_alive():
+    _daemon.reap()  # clean up zombie from previous run if any
     _check_port_free(_base_grpc_port)
     _daemon.launch()
     print(f"Game daemon launched on port {_base_grpc_port}")
-
-
-def _env_factory():
-    _ensure_daemon_started()
-    return OpenRAEnvironment(
-        grpc_port=_base_grpc_port,
-        multi_session=True,
-    )
 
 
 app = create_app(
@@ -108,7 +105,7 @@ app = create_app(
 
 @app.on_event("startup")
 def _on_startup():
-    """Startup hook for web app only. Daemon starts lazily on demand."""
+    """Startup hook (grpc_worker removed — per-session channels)."""
     pass
 
 
@@ -124,14 +121,16 @@ def _on_shutdown():
 
 @app.get("/health")
 def health_check():
-    """Lightweight health check for container probes."""
-    return {"status": "healthy"}
-
-
-@app.get("/daemon-health")
-def daemon_health():
-    """Detailed daemon/gRPC health for debugging."""
+    """Health check endpoint. Auto-restarts daemon if dead, verifies gRPC."""
     alive = _daemon.is_alive()
+    if not alive:
+        _daemon.reap()
+        try:
+            _daemon.launch()
+            alive = _daemon.is_alive()
+            print(f"Auto-restarted game daemon (PID {_daemon.pid})")
+        except Exception as e:
+            print(f"Failed to auto-restart daemon: {e}")
     grpc_ok = False
     if alive:
         try:
@@ -141,7 +140,6 @@ def daemon_health():
             _ch.close()
         except Exception:
             pass
-
     return {
         "status": "healthy" if (alive and grpc_ok) else "degraded",
         "daemon_pid": _daemon.pid,
@@ -438,7 +436,6 @@ async def _run_try_agent(opponent: str):
     yield _sse("status", {"message": f"Launching game vs {opponent} AI..."})
 
     try:
-        _ensure_daemon_started()
         async with OpenRAMCPClient(
             base_url="http://localhost:8000", message_timeout_s=300.0
         ) as env:
