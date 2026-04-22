@@ -84,16 +84,29 @@ def _ensure_daemon_started() -> None:
     if _daemon.is_alive():
         return
 
+    port = _current_grpc_port()
     _daemon.reap()
-    _check_port_free(_base_grpc_port)
+    _check_port_free(port)
     _daemon.launch()
-    print(f"Game daemon launched on port {_base_grpc_port}")
+    print(f"Game daemon launched on port {port}")
+
+
+def _current_grpc_port() -> int:
+    return int(getattr(_daemon.config, "grpc_port", _base_grpc_port))
+
+
+def _internal_base_url() -> str:
+    override = os.getenv("OPENRA_INTERNAL_BASE_URL")
+    if override:
+        return override.rstrip("/")
+    root_path = os.getenv("OPENRA_ROOT_PATH", "").rstrip("/")
+    return f"http://localhost:8000{root_path}"
 
 
 def _env_factory():
     _ensure_daemon_started()
     return OpenRAEnvironment(
-        grpc_port=_base_grpc_port,
+        grpc_port=_current_grpc_port(),
         multi_session=True,
     )
 
@@ -312,7 +325,7 @@ async def _run_try_agent(opponent: str):
     try:
         _ensure_daemon_started()
         async with OpenRAMCPClient(
-            base_url="http://localhost:8000", message_timeout_s=300.0
+            base_url=_internal_base_url(), message_timeout_s=300.0
         ) as env:
             yield _sse("status", {"message": "Resetting environment..."})
             await env.reset()
@@ -731,7 +744,7 @@ footer {
 <!-- Nav -->
 <nav>
   <div class="nav-inner">
-    <a href="/" class="nav-logo">
+    <a href="." class="nav-logo">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="square" stroke-linejoin="miter">
         <circle cx="12" cy="12" r="10"/>
         <circle cx="12" cy="12" r="6" stroke-opacity="0.5"/>
@@ -742,9 +755,9 @@ footer {
       <span>OPENRA<span class="rl">-RL</span></span>
     </a>
     <div class="nav-links">
-      <a href="/try" style="color:#ef4444;font-weight:700;">TRY</a>
+      <a href="try" style="color:#ef4444;font-weight:700;">TRY</a>
       <a href="https://openra-rl.dev/docs/getting-started">DOCS</a>
-      <a href="/docs">API</a>
+      <a href="docs">API</a>
       <a href="https://github.com/yxc20089/OpenRA-RL">GITHUB</a>
     </div>
   </div>
@@ -763,7 +776,7 @@ footer {
     Connect via WebSocket or HTTP, send actions, observe the battlefield.
   </div>
   <div class="buttons">
-    <a href="/try" class="btn-soviet">
+    <a href="try" class="btn-soviet">
       WATCH AI PLAY
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
     </a>
@@ -785,17 +798,17 @@ footer {
     <div class="card-military">
       <h3>API DOCS</h3>
       <p>Interactive Swagger UI with all REST and WebSocket endpoints.</p>
-      <a href="/docs">/docs &rarr;</a>
+      <a href="docs">/docs &rarr;</a>
     </div>
     <div class="card-military">
       <h3>HEALTH CHECK</h3>
       <p>Server status and readiness probe for monitoring.</p>
-      <a href="/health">/health &rarr;</a>
+      <a href="health">/health &rarr;</a>
     </div>
     <div class="card-military">
       <h3>ENV SCHEMA</h3>
       <p>JSON schemas for actions, observations, and game state.</p>
-      <a href="/schema">/schema &rarr;</a>
+      <a href="schema">/schema &rarr;</a>
     </div>
   </div>
 </div>
@@ -1000,7 +1013,7 @@ footer {
 
 <nav>
   <div class="nav-inner">
-    <a href="/" class="nav-logo">
+    <a href="." class="nav-logo">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="square" stroke-linejoin="miter">
         <circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6" stroke-opacity="0.5"/>
         <circle cx="12" cy="12" r="2" fill="currentColor"/><path d="M12 12l8.5-8.5"/>
@@ -1009,9 +1022,9 @@ footer {
       <span>OPENRA<span class="rl">-RL</span></span>
     </a>
     <div class="nav-links">
-      <a href="/try" style="color:#ef4444;font-weight:700;">TRY</a>
+      <a href="try" style="color:#ef4444;font-weight:700;">TRY</a>
       <a href="https://openra-rl.dev/docs/getting-started">DOCS</a>
-      <a href="/docs">API</a>
+      <a href="docs">API</a>
       <a href="https://github.com/yxc20089/OpenRA-RL">GITHUB</a>
     </div>
   </div>
@@ -1043,7 +1056,7 @@ footer {
   </div>
 </div>
 
-<footer>&copy; 2025 OpenRA-RL Contributors &mdash; <a href="/">Home</a></footer>
+<footer>&copy; 2025 OpenRA-RL Contributors &mdash; <a href=".">Home</a></footer>
 
 <script>
 let eventSource = null;
@@ -1072,7 +1085,7 @@ function startGame() {
 
   log('Connecting to game server...', 'log-status');
 
-  fetch('/try-agent?opponent=' + encodeURIComponent(opponent))
+  fetch('try-agent?opponent=' + encodeURIComponent(opponent))
     .then(response => {
       if (!response.ok) {
         log('Server error: ' + response.status, 'log-error');
@@ -1191,7 +1204,7 @@ function resetBtn() {
 }
 
 // Auto-connect if a game is currently running
-fetch('/try-status')
+fetch('try-status')
   .then(r => r.json())
   .then(status => {
     if (status.game_running) {
@@ -1236,7 +1249,7 @@ def register_routes(app):
         grpc_ok = False
         if alive:
             try:
-                _ch = grpc.insecure_channel(f"localhost:{_base_grpc_port}")
+                _ch = grpc.insecure_channel(f"localhost:{_current_grpc_port()}")
                 grpc.channel_ready_future(_ch).result(timeout=2.0)
                 grpc_ok = True
                 _ch.close()
@@ -1247,7 +1260,7 @@ def register_routes(app):
             "daemon_pid": _daemon.pid,
             "daemon_alive": alive,
             "grpc_ok": grpc_ok,
-            "grpc_port": _base_grpc_port,
+            "grpc_port": _current_grpc_port(),
         }
 
     @app.get("/replays/latest")
@@ -1306,6 +1319,7 @@ def register_routes(app):
             _restart_port_offset[0] += 1
             new_port = _base_grpc_port + _restart_port_offset[0]
             _daemon.config.grpc_port = new_port
+            _base_grpc_port = new_port
 
             _daemon.launch()
 
