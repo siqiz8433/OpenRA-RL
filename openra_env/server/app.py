@@ -98,66 +98,6 @@ def _env_factory():
     )
 
 
-_app = None
-
-
-def get_app():
-    global _app
-    if _app is not None:
-        return _app
-
-    app = create_app(
-        _env_factory,
-        OpenRAAction,
-        OpenRAObservation,
-        env_name="openra_env",
-        max_concurrent_envs=_max_concurrent,
-    )
-
-    @app.on_event("startup")
-    def _on_startup():
-        """Startup hook for web app only. Daemon starts lazily on demand."""
-        pass
-
-    @app.on_event("shutdown")
-    def _on_shutdown():
-        """Kill the game daemon when uvicorn shuts down."""
-        if _daemon.is_alive():
-            print(f"Shutting down game daemon (PID {_daemon.pid})...")
-            _daemon.kill(timeout=10.0)
-        else:
-            _daemon.reap()
-
-    @get_app().get("/health")
-    def health_check():
-        """Lightweight health check for web/container probes."""
-        return {"status": "healthy"}
-
-    @get_app().get("/daemon-health")
-    def daemon_health():
-        """Detailed daemon/gRPC health for debugging."""
-        alive = _daemon.is_alive()
-        grpc_ok = False
-        if alive:
-            try:
-                _ch = grpc.insecure_channel(f"localhost:{_base_grpc_port}")
-                grpc.channel_ready_future(_ch).result(timeout=2.0)
-                grpc_ok = True
-                _ch.close()
-            except Exception:
-                pass
-        return {
-            "status": "healthy" if (alive and grpc_ok) else "degraded",
-            "daemon_pid": _daemon.pid,
-            "daemon_alive": alive,
-            "grpc_ok": grpc_ok,
-            "grpc_port": _base_grpc_port,
-        }
-
-    _app = app
-    return _app
-
-
 def _latest_replay_file() -> Path | None:
     replay_roots = [
         Path(_openra_path) / "Support" / "Replays",
@@ -176,38 +116,6 @@ def _latest_replay_file() -> Path | None:
     return max(replays, key=lambda p: p.stat().st_mtime)
 
 
-@get_app().get("/replays/latest")
-def latest_replay(download: bool = Query(True, description="Return the latest replay file when true, otherwise return metadata only.")):
-    replay = _latest_replay_file()
-    if replay is None:
-        raise HTTPException(status_code=404, detail="No replay files found")
-
-    if not download:
-        stat = replay.stat()
-        return {
-            "path": str(replay),
-            "filename": replay.name,
-            "size_bytes": stat.st_size,
-            "modified_time": stat.st_mtime,
-        }
-
-    return FileResponse(
-        path=replay,
-        filename=replay.name,
-        media_type="application/octet-stream",
-    )
-
-
-@get_app().post("/shutdown")
-def shutdown_server():
-    """Gracefully shut down the game daemon and exit."""
-    import threading
-    def _do_shutdown():
-        time.sleep(0.5)  # let response flush
-        _daemon.kill(timeout=10.0)
-        os._exit(0)
-    threading.Thread(target=_do_shutdown, daemon=True).start()
-    return {"status": "shutting_down", "daemon_pid": _daemon.pid}
 
 _restart_port_offset = [0]  # mutable counter for port rotation
 
@@ -234,49 +142,6 @@ def _cleanup_scenario_maps():
     if n_removed > 0:
         print(f"Cleaned up {n_removed} old scenario maps from {maps_dir}")
 
-@get_app().post("/restart-daemon")
-def restart_daemon():
-    """Kill and restart the .NET daemon on a NEW gRPC port for truly clean state."""
-    global _base_grpc_port
-    try:
-        if _daemon.is_alive():
-            _daemon.kill(timeout=10.0)
-        _daemon.reap()
-        import time as _time
-        _time.sleep(2)
-
-        # Clean up old scenario maps to prevent MapCache scan slowdown.
-        # Each episode writes a unique _scenario_*.oramap file. These accumulate
-        # across waves, making LoadMaps() progressively slower (scans ALL files).
-        # With 60+ stock maps + 40+ scenario maps, LoadMaps takes ~2s per call,
-        # and 20 sessions each calling it = 40s — enough to cause timeouts.
-        _cleanup_scenario_maps()
-
-        # Use a new gRPC port each restart to avoid any residual state
-        _restart_port_offset[0] += 1
-        new_port = _base_grpc_port + _restart_port_offset[0]
-        _daemon.config.grpc_port = new_port
-
-        _daemon.launch()
-
-        # Wait for daemon to be ready
-        _check_channel = grpc.insecure_channel(f"localhost:{new_port}")
-        for _ in range(30):
-            try:
-                grpc.channel_ready_future(_check_channel).result(timeout=1.0)
-                break
-            except Exception:
-                _time.sleep(0.5)
-        _check_channel.close()
-
-        return {"status": "restarted", "daemon_pid": _daemon.pid, "grpc_port": new_port}
-    except Exception as e:
-        return {"status": "failed", "error": str(e)}
-
-
-
-
-# ── Try Agent: LLM demo endpoint ────────────────────────────────────────────
 
 _TRY_MAX_TURNS = 30
 _TRY_MAX_TIME = 300  # 5 minutes
@@ -666,41 +531,6 @@ async def _run_try_agent(opponent: str):
         yield _sse("error_event", {"message": str(e)})
 
 
-@get_app().get("/try-agent")
-async def try_agent(
-    opponent: str = Query("Normal", pattern="^(Easy|Normal|Hard)$"),
-):
-    """SSE stream of an LLM agent playing Red Alert.
-
-    Multiple viewers can watch simultaneously. The first request starts
-    a new game; subsequent requests join as spectators of the ongoing game.
-    """
-    queue = _broadcaster.subscribe()
-
-    if _broadcaster.game_running:
-        await queue.put(_sse("status", {"message": "Joining ongoing game as spectator..."}))
-        await _broadcaster.replay_to(queue)
-    else:
-        await _broadcaster.start_game(opponent)
-
-    async def stream():
-        try:
-            while True:
-                event = await asyncio.wait_for(queue.get(), timeout=360)
-                if '"_stream_end"' in event:
-                    break
-                yield event
-        except asyncio.TimeoutError:
-            pass
-        finally:
-            _broadcaster.unsubscribe(queue)
-
-    return StreamingResponse(
-        stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
 
 LANDING_PAGE = """\
 <!DOCTYPE html>
@@ -1053,13 +883,6 @@ footer {
 </html>"""
 
 
-@get_app().get("/", response_class=HTMLResponse)
-async def root():
-    """Landing page for the HuggingFace Space."""
-    return LANDING_PAGE
-
-
-# ── Try Page: Watch AI Play ──────────────────────────────────────────────────
 
 TRY_PAGE = """\
 <!DOCTYPE html>
@@ -1384,19 +1207,197 @@ fetch('/try-status')
 </html>"""
 
 
-@get_app().get("/try-status")
-async def try_status():
-    """Check if a game is currently running."""
-    return {
-        "game_running": _broadcaster.game_running,
-        "opponent": _broadcaster._opponent if _broadcaster.game_running else "",
-    }
 
 
-@get_app().get("/try", response_class=HTMLResponse)
-async def try_page():
-    """Interactive page to watch an LLM agent play Red Alert."""
-    return TRY_PAGE
+def register_routes(app):
+    @app.on_event("startup")
+    def _on_startup():
+        """Startup hook for web app only. Daemon starts lazily on demand."""
+        pass
+
+    @app.on_event("shutdown")
+    def _on_shutdown():
+        """Kill the game daemon when uvicorn shuts down."""
+        if _daemon.is_alive():
+            print(f"Shutting down game daemon (PID {_daemon.pid})...")
+            _daemon.kill(timeout=10.0)
+        else:
+            _daemon.reap()
+
+    @app.get("/health")
+    def health_check():
+        """Lightweight health check for web/container probes."""
+        return {"status": "healthy"}
+
+    @app.get("/daemon-health")
+    def daemon_health():
+        """Detailed daemon/gRPC health for debugging."""
+        alive = _daemon.is_alive()
+        grpc_ok = False
+        if alive:
+            try:
+                _ch = grpc.insecure_channel(f"localhost:{_base_grpc_port}")
+                grpc.channel_ready_future(_ch).result(timeout=2.0)
+                grpc_ok = True
+                _ch.close()
+            except Exception:
+                pass
+        return {
+            "status": "healthy" if (alive and grpc_ok) else "degraded",
+            "daemon_pid": _daemon.pid,
+            "daemon_alive": alive,
+            "grpc_ok": grpc_ok,
+            "grpc_port": _base_grpc_port,
+        }
+
+    @app.get("/replays/latest")
+    def latest_replay(
+        download: bool = Query(
+            True,
+            description="Return the latest replay file when true, otherwise return metadata only.",
+        )
+    ):
+        replay = _latest_replay_file()
+        if replay is None:
+            raise HTTPException(status_code=404, detail="No replay files found")
+
+        if not download:
+            stat = replay.stat()
+            return {
+                "path": str(replay),
+                "filename": replay.name,
+                "size_bytes": stat.st_size,
+                "modified_time": stat.st_mtime,
+            }
+
+        return FileResponse(
+            path=replay,
+            filename=replay.name,
+            media_type="application/octet-stream",
+        )
+
+    @app.post("/shutdown")
+    def shutdown_server():
+        """Gracefully shut down the game daemon and exit."""
+        import threading
+
+        def _do_shutdown():
+            time.sleep(0.5)  # let response flush
+            _daemon.kill(timeout=10.0)
+            os._exit(0)
+
+        threading.Thread(target=_do_shutdown, daemon=True).start()
+        return {"status": "shutting_down", "daemon_pid": _daemon.pid}
+
+    @app.post("/restart-daemon")
+    def restart_daemon():
+        """Kill and restart the .NET daemon on a NEW gRPC port for truly clean state."""
+        global _base_grpc_port
+        try:
+            if _daemon.is_alive():
+                _daemon.kill(timeout=10.0)
+            _daemon.reap()
+            import time as _time
+
+            _time.sleep(2)
+
+            _cleanup_scenario_maps()
+
+            _restart_port_offset[0] += 1
+            new_port = _base_grpc_port + _restart_port_offset[0]
+            _daemon.config.grpc_port = new_port
+
+            _daemon.launch()
+
+            _check_channel = grpc.insecure_channel(f"localhost:{new_port}")
+            for _ in range(30):
+                try:
+                    grpc.channel_ready_future(_check_channel).result(timeout=1.0)
+                    break
+                except Exception:
+                    _time.sleep(0.5)
+            _check_channel.close()
+
+            return {
+                "status": "restarted",
+                "daemon_pid": _daemon.pid,
+                "grpc_port": new_port,
+            }
+        except Exception as e:
+            return {"status": "failed", "error": str(e)}
+
+    @app.get("/try-agent")
+    async def try_agent(
+        opponent: str = Query("Normal", pattern="^(Easy|Normal|Hard)$"),
+    ):
+        """SSE stream of an LLM agent playing Red Alert.
+
+        Multiple viewers can watch simultaneously. The first request starts
+        a new game; subsequent requests join as spectators of the ongoing game.
+        """
+        queue = _broadcaster.subscribe()
+
+        if _broadcaster.game_running:
+            await queue.put(
+                _sse("status", {"message": "Joining ongoing game as spectator..."})
+            )
+            await _broadcaster.replay_to(queue)
+        else:
+            await _broadcaster.start_game(opponent)
+
+        async def stream():
+            try:
+                while True:
+                    event = await asyncio.wait_for(queue.get(), timeout=360)
+                    if '"_stream_end"' in event:
+                        break
+                    yield event
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                _broadcaster.unsubscribe(queue)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/", response_class=HTMLResponse)
+    async def root():
+        """Landing page for the HuggingFace Space."""
+        return LANDING_PAGE
+
+    @app.get("/try-status")
+    async def try_status():
+        """Check if a game is currently running."""
+        return {
+            "game_running": _broadcaster.game_running,
+            "opponent": _broadcaster._opponent if _broadcaster.game_running else "",
+        }
+
+    @app.get("/try", response_class=HTMLResponse)
+    async def try_page():
+        """Interactive page to watch an LLM agent play Red Alert."""
+        return TRY_PAGE
+
+
+_app = None
+
+
+def get_app():
+    global _app
+    if _app is None:
+        app = create_app(
+            _env_factory,
+            OpenRAAction,
+            OpenRAObservation,
+            env_name="openra_env",
+            max_concurrent_envs=_max_concurrent,
+        )
+        register_routes(app)
+        _app = app
+    return _app
 
 
 def main():
@@ -1416,6 +1417,7 @@ def main():
         ws_ping_interval=None,
         ws_ping_timeout=None,
     )
+
 
 if __name__ == "__main__":
     main()
