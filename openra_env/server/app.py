@@ -1266,6 +1266,28 @@ def register_routes(app):
             "grpc_port": _current_grpc_port(),
         }
 
+    @app.get("/daemon-logs")
+    def daemon_logs(
+        tail_chars: int = Query(
+            12000,
+            ge=0,
+            le=100000,
+            description="Return the last N characters from daemon stdout/stderr buffers.",
+        )
+    ):
+        stdout = _daemon.get_stdout()
+        stderr = _daemon.get_stderr()
+        if tail_chars > 0:
+            stdout = stdout[-tail_chars:]
+            stderr = stderr[-tail_chars:]
+        return {
+            "daemon_pid": _daemon.pid,
+            "daemon_alive": _daemon.is_alive(),
+            "grpc_port": _current_grpc_port(),
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+
     @app.get("/replays/latest")
     def latest_replay(
         download: bool = Query(
