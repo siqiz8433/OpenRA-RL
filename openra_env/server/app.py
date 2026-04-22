@@ -100,12 +100,9 @@ def _internal_base_url() -> str:
     if override:
         return override.rstrip("/")
 
-    root_path = os.getenv("OPENRA_ROOT_PATH")
-    if root_path is None:
-        # Default for the current HF deployment where the app is mounted under /openra.
-        root_path = "/openra"
-
-    root_path = root_path.rstrip("/")
+    # Internal localhost calls usually bypass any external reverse-proxy prefix.
+    # Use the root path only when deployment explicitly requires it.
+    root_path = os.getenv("OPENRA_ROOT_PATH", "").rstrip("/")
     return f"http://localhost:8000{root_path}"
 
 
@@ -1418,6 +1415,11 @@ def get_app():
         register_routes(app)
         _app = app
     return _app
+
+
+# Expose the ASGI app at module scope for loaders configured with
+# `openra_env.server.app:app` (for example `openenv.yaml` on Hugging Face).
+app = get_app()
 
 
 def main():
