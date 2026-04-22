@@ -80,6 +80,10 @@ def _check_port_free(port: int) -> None:
             print(f"Port {port} in TIME_WAIT, proceeding with SO_REUSEADDR")
 
 
+def _current_grpc_port() -> int:
+    return int(getattr(_daemon.config, "grpc_port", _base_grpc_port))
+
+
 def _ensure_daemon_started() -> None:
     if _daemon.is_alive():
         return
@@ -91,15 +95,17 @@ def _ensure_daemon_started() -> None:
     print(f"Game daemon launched on port {port}")
 
 
-def _current_grpc_port() -> int:
-    return int(getattr(_daemon.config, "grpc_port", _base_grpc_port))
-
-
 def _internal_base_url() -> str:
     override = os.getenv("OPENRA_INTERNAL_BASE_URL")
     if override:
         return override.rstrip("/")
-    root_path = os.getenv("OPENRA_ROOT_PATH", "").rstrip("/")
+
+    root_path = os.getenv("OPENRA_ROOT_PATH")
+    if root_path is None:
+        # Default for the current HF deployment where the app is mounted under /openra.
+        root_path = "/openra"
+
+    root_path = root_path.rstrip("/")
     return f"http://localhost:8000{root_path}"
 
 
